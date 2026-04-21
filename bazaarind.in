@@ -1,0 +1,412 @@
+// ═══════════════════════════════════════════════════════
+// BAZAAR IND — Node.js + Express Backend
+// नया India का नया Bazaar
+// ═══════════════════════════════════════════════════════
+
+const express = require('express');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'bazaar-ind-secret-2025';
+
+// ── MIDDLEWARE ──
+app.use(cors({ origin: '*', credentials: true }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use('/uploads', express.static('uploads'));
+
+// ── IN-MEMORY DB (Replace with MongoDB/PostgreSQL in production) ──
+let db = {
+  users: [
+    { id: 1, name: 'Rahul Kumar', email: 'rahul@bazaarind.in', phone: '9876543210', 
+      password: bcrypt.hashSync('password123', 10), city: 'Patna', state: 'Bihar',
+      verified: true, rating: 4.5, createdAt: new Date('2025-01-01') }
+  ],
+  listings: [
+    { id: 1, title: 'iPhone 14 Pro Max 256GB', price: 68000, category: 'Mobiles',
+      condition: 'Like New', city: 'Patna', area: 'Boring Road', description: 'Barely used, all accessories included',
+      sellerId: 1, images: [], featured: true, status: 'active', views: 245,
+      tags: ['256GB', 'Face ID'], createdAt: new Date() },
+    { id: 2, title: 'Hero Splendor Plus 2022', price: 55000, category: 'Bikes',
+      condition: 'Good', city: 'Gaya', area: 'Station Road', description: '28000 km, single owner',
+      sellerId: 1, images: [], featured: false, status: 'active', views: 130,
+      tags: ['28K km', '2022'], createdAt: new Date() }
+  ],
+  chats: [],
+  inventory: [],
+  payments: [],
+  nextId: { users: 2, listings: 3, chats: 1, inventory: 1, payments: 1 }
+};
+
+// ── UPLOAD CONFIG ──
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = 'uploads/listings';
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => cb(null, ${Date.now()}-${file.originalname})
+});
+const upload = multer({ storage, limits: { fileSize: 5 * 1024 * 1024 } });
+
+// ── AUTH MIDDLEWARE ──
+const auth = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ success: false, message: 'No token provided' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ success: false, message: 'Invalid token' });
+  }
+};
+
+// ══════════════════════════════════════
+// AUTH ROUTES
+// ══════════════════════════════════════
+
+// POST /api/auth/register
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { name, email, phone, password, city, state } = req.body;
+    if (!name || !email || !password) 
+      return res.status(400).json({ success: false, message: 'Name, email and password required' });
+    
+    if (db.users.find(u => u.email === email))
+      return res.status(409).json({ success: false, message: 'Email already registered' });
+
+    const user = {
+      id: db.nextId.users++, name, email, phone: phone || '',
+      password: await bcrypt.hash(password, 10),
+      city: city || '', state: state || 'Bihar',
+      verified: false, rating: 0, createdAt: new Date()
+    };
+    db.users.push(user);
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    const { password: _, ...userWithoutPass } = user;
+    res.status(201).json({ success: true, message: 'Registration successful!', token, user: userWithoutPass });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/auth/login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = db.users.find(u => u.email === email);
+    if (!user || !await bcrypt.compare(password, user.password))
+      return res.status(401).json({ success: false, message: 'Invalid email or password' });
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    const { password: _, ...userWithoutPass } = user;
+    res.json({ success: true, message: 'Login successful!', token, user: userWithoutPass });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/auth/me
+app.get('/api/auth/me', auth, (req, res) => {
+  const user = db.users.find(u => u.id === req.user.id);
+  if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+  const { password: _, ...userWithoutPass } = user;
+  res.json({ success: true, user: userWithoutPass });
+});
+
+// ══════════════════════════════════════
+// LISTINGS ROUTES
+// ══════════════════════════════════════
+
+// GET /api/listings — with search, filter, sort, pagination
+app.get('/api/listings', (req, res) => {
+  try {
+    let { q, category, city, minPrice, maxPrice, condition, sort, page = 1, limit = 20, featured } = req.query;
+    let results = db.listings.filter(l => l.status === 'active');
+
+    if (q) {
+      const query = q.toLowerCase();
+      results = results.filter(l =>
+        l.title.toLowerCase().includes(query) ||
+        l.description.toLowerCase().includes(query) ||
+        l.category.toLowerCase().includes(query) ||
+        l.city.toLowerCase().includes(query)
+      );
+    }
+    if (category) results = results.filter(l => l.category === category);
+    if (city) results = results.filter(l => l.city.toLowerCase().includes(city.toLowerCase()));
+    if (minPrice) results = results.filter(l => l.price >= parseInt(minPrice));
+    if (maxPrice) results = results.filter(l => l.price <= parseInt(maxPrice));
+    if (condition) results = results.filter(l => l.condition === condition);
+    if (featured === 'true') results = results.filter(l => l.featured);
+
+    // Sort
+    if (sort === 'price_asc') results.sort((a, b) => a.price - b.price);
+    else if (sort === 'price_desc') results.sort((a, b) => b.price - a.price);
+    else results.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)); // newest first
+
+    // Pagination
+    const total = results.length;
+    const start = (parseInt(page) - 1) * parseInt(limit);
+    results = results.slice(start, start + parseInt(limit));
+
+    // Enrich with seller info
+    results = results.map(l => ({
+      ...l,
+      seller: (() => {
+        const s = db.users.find(u => u.id === l.sellerId);
+        return s ? { id: s.id, name: s.name, rating: s.rating, verified: s.verified } : null;
+      })()
+    }));
+
+    res.json({ success: true, listings: results, total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/listings/:id
+app.get('/api/listings/:id', (req, res) => {
+  const listing = db.listings.find(l => l.id === parseInt(req.params.id));
+  if (!listing) return res.status(404).json({ success: false, message: 'Listing not found' });
+  listing.views++;
+  const seller = db.users.find(u => u.id === listing.sellerId);
+  res.json({ success: true, listing: { ...listing, seller: seller ? { id: seller.id, name: seller.name, phone: seller.phone, rating: seller.rating, verified: seller.verified, city: seller.city } : null } });
+});
+
+// POST /api/listings — create listing
+app.post('/api/listings', auth, upload.array('images', 8), (req, res) => {
+  try {
+    const { title, price, category, condition, city, area, description, tags } = req.body;
+    if (!title || !price || !category || !city)
+      return res.status(400).json({ success: false, message: 'Title, price, category and city required' });
+
+    const images = req.files ? req.files.map(f => /uploads/listings/${f.filename}) : [];
+    const listing = {
+      id: db.nextId.listings++, title, price: parseInt(price), category,
+      condition: condition || 'Good', city, area: area || city, description: description || '',
+      sellerId: req.user.id, images, featured: false, status: 'active', views: 0,
+      tags: tags ? JSON.parse(tags) : [], createdAt: new Date()
+    };
+    db.listings.push(listing);
+    res.status(201).json({ success: true, message: 'Ad posted successfully!', listing });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// PUT /api/listings/:id — update
+app.put('/api/listings/:id', auth, (req, res) => {
+  const listing = db.listings.find(l => l.id === parseInt(req.params.id) && l.sellerId === req.user.id);
+  if (!listing) return res.status(404).json({ success: false, message: 'Listing not found or not yours' });
+  Object.assign(listing, req.body, { id: listing.id, sellerId: listing.sellerId });
+  res.json({ success: true, message: 'Listing updated', listing });
+});
+
+// DELETE /api/listings/:id
+app.delete('/api/listings/:id', auth, (req, res) => {
+  const idx = db.listings.findIndex(l => l.id === parseInt(req.params.id) && l.sellerId === req.user.id);
+  if (idx === -1) return res.status(404).json({ success: false, message: 'Listing not found' });
+  db.listings[idx].status = 'deleted';
+  res.json({ success: true, message: 'Listing deleted' });
+});
+
+// POST /api/listings/:id/boost — feature a listing
+app.post('/api/listings/:id/boost', auth, (req, res) => {
+  const listing = db.listings.find(l => l.id === parseInt(req.params.id) && l.sellerId === req.user.id);
+  if (!listing) return res.status(404).json({ success: false, message: 'Listing not found' });
+  listing.featured = true;
+  listing.featuredUntil = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
+  res.json({ success: true, message: 'Listing boosted for 30 days!', listing });
+});
+
+// ══════════════════════════════════════
+// CATEGORIES
+// ══════════════════════════════════════
+const CATEGORIES = [
+  { name: 'Mobiles', icon: '📱', count: 0 }, { name: 'Electronics', icon: '💻', count: 0 },
+  { name: 'Cars', icon: '🚗', count: 0 }, { name: 'Bikes', icon: '🏍️', count: 0 },
+  { name: 'Property', icon: '🏠', count: 0 }, { name: 'Furniture', icon: '🛋️', count: 0 },
+  { name: 'Fashion', icon: '👗', count: 0 }, { name: 'Jobs', icon: '💼', count: 0 },
+  { name: 'Books', icon: '📚', count: 0 }, { name: 'Gaming', icon: '🎮', count: 0 },
+  { name: 'Pets', icon: '🐶', count: 0 }, { name: 'Sports', icon: '🏋️', count: 0 },
+];
+
+app.get('/api/categories', (req, res) => {
+  const cats = CATEGORIES.map(c => ({
+    ...c, count: db.listings.filter(l => l.category === c.name && l.status === 'active').length
+  }));
+  res.json({ success: true, categories: cats });
+});
+
+// ══════════════════════════════════════
+// CHAT ROUTES
+// ══════════════════════════════════════
+
+// GET /api/chats — get my chats
+app.get('/api/chats', auth, (req, res) => {
+  const myChats = db.chats.filter(c => c.buyerId === req.user.id || c.sellerId === req.user.id);
+  res.json({ success: true, chats: myChats });
+});
+
+// POST /api/chats — start or get chat
+app.post('/api/chats', auth, (req, res) => {
+  const { listingId, message } = req.body;
+  const listing = db.listings.find(l => l.id === parseInt(listingId));
+  if (!listing) return res.status(404).json({ success: false, message: 'Listing not found' });
+  if (listing.sellerId === req.user.id) return res.status(400).json({ success: false, message: 'Cannot chat with yourself' });
+
+  let chat = db.chats.find(c => c.listingId === parseInt(listingId) && c.buyerId === req.user.id);
+  if (!chat) {
+    chat = { id: db.nextId.chats++, listingId: parseInt(listingId), buyerId: req.user.id, sellerId: listing.sellerId, messages: [], createdAt: new Date() };
+    db.chats.push(chat);
+  }
+  if (message) {
+    chat.messages.push({ from: req.user.id, text: message, time: new Date() });
+  }
+  res.json({ success: true, chat });
+});
+
+// POST /api/chats/:id/message
+app.post('/api/chats/:id/message', auth, (req, res) => {
+  const chat = db.chats.find(c => c.id === parseInt(req.params.id) && (c.buyerId === req.user.id || c.sellerId === req.user.id));
+  if (!chat) return res.status(404).json({ success: false, message: 'Chat not found' });
+  chat.messages.push({ from: req.user.id, text: req.body.text, time: new Date() });
+  res.json({ success: true, message: 'Message sent', chat });
+});
+
+// ══════════════════════════════════════
+// INVENTORY MANAGEMENT ROUTES
+// ══════════════════════════════════════
+
+// GET /api/inventory
+app.get('/api/inventory', auth, (req, res) => {
+  const items = db.inventory.filter(i => i.ownerId === req.user.id);
+  res.json({ success: true, inventory: items });
+});
+
+// POST /api/inventory — add item
+app.post('/api/inventory', auth, (req, res) => {
+  const { name, sku, quantity, minStock, price, costPrice, category, description } = req.body;
+  if (!name || quantity === undefined) return res.status(400).json({ success: false, message: 'Name and quantity required' });
+
+  const item = {
+    id: db.nextId.inventory++, name, sku: sku || SKU-${Date.now()},
+    quantity: parseInt(quantity), minStock: parseInt(minStock) || 5,
+    price: parseFloat(price) || 0, costPrice: parseFloat(costPrice) || 0,
+    category: category || 'General', description: description || '',
+    ownerId: req.user.id, status: 'active', createdAt: new Date(), updatedAt: new Date()
+  };
+  db.inventory.push(item);
+  res.status(201).json({ success: true, message: 'Item added to inventory', item });
+});
+
+// PUT /api/inventory/:id — update stock
+app.put('/api/inventory/:id', auth, (req, res) => {
+  const item = db.inventory.find(i => i.id === parseInt(req.params.id) && i.ownerId === req.user.id);
+  if (!item) return res.status(404).json({ success: false, message: 'Inventory item not found' });
+  Object.assign(item, req.body, { id: item.id, ownerId: item.ownerId, updatedAt: new Date() });
+  const alert = item.quantity <= item.minStock ? '⚠️ Low stock alert!' : null;
+  res.json({ success: true, message: 'Inventory updated', item, alert });
+});
+
+// POST /api/inventory/:id/adjust — adjust stock quantity
+app.post('/api/inventory/:id/adjust', auth, (req, res) => {
+  const { adjustment, reason } = req.body;
+  const item = db.inventory.find(i => i.id === parseInt(req.params.id) && i.ownerId === req.user.id);
+  if (!item) return res.status(404).json({ success: false, message: 'Not found' });
+  item.quantity += parseInt(adjustment);
+  if (item.quantity < 0) item.quantity = 0;
+  item.updatedAt = new Date();
+  const lowStock = item.quantity <= item.minStock;
+  res.json({ success: true, item, lowStock, alert: lowStock ? ⚠️ Only ${item.quantity} left! : null });
+});
+
+// GET /api/inventory/alerts — low stock alerts
+app.get('/api/inventory/alerts', auth, (req, res) => {
+  const alerts = db.inventory.filter(i => i.ownerId === req.user.id && i.quantity <= i.minStock);
+  res.json({ success: true, alerts, count: alerts.length });
+});
+
+// ══════════════════════════════════════
+// PAYMENT ROUTES (Razorpay simulation)
+// ══════════════════════════════════════
+
+// POST /api/payments/create-order
+app.post('/api/payments/create-order', auth, (req, res) => {
+  const { amount, listingId, type } = req.body; // type: 'featured', 'premium'
+  const order = {
+    id: db.nextId.payments++, orderId: BI_${Date.now()},
+    amount: parseInt(amount), currency: 'INR', type: type || 'featured',
+    listingId: listingId ? parseInt(listingId) : null, userId: req.user.id,
+    status: 'pending', createdAt: new Date()
+  };
+  db.payments.push(order);
+  // In production: call Razorpay API here to get actual order ID
+  res.json({ success: true, order, razorpayKey: 'rzp_test_YOUR_KEY_HERE', message: 'Order created — integrate Razorpay checkout' });
+});
+
+// POST /api/payments/verify — verify after payment
+app.post('/api/payments/verify', auth, (req, res) => {
+  const { orderId, paymentId } = req.body;
+  const order = db.payments.find(p => p.orderId === orderId && p.userId === req.user.id);
+  if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+  
+  order.status = 'paid';
+  order.paymentId = paymentId;
+  order.paidAt = new Date();
+
+  // Activate the boost
+  if (order.type === 'featured' && order.listingId) {
+    const listing = db.listings.find(l => l.id === order.listingId);
+    if (listing) { listing.featured = true; listing.featuredUntil = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); }
+  }
+  res.json({ success: true, message: '✅ Payment verified and boost activated!', order });
+});
+
+// ══════════════════════════════════════
+// SEARCH & ANALYTICS
+// ══════════════════════════════════════
+
+// GET /api/search/suggestions
+app.get('/api/search/suggestions', (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.json({ success: true, suggestions: [] });
+  const query = q.toLowerCase();
+  const suggestions = db.listings
+    .filter(l => l.status === 'active' && l.title.toLowerCase().includes(query))
+    .slice(0, 5)
+    .map(l => ({ id: l.id, title: l.title, price: l.price, category: l.category }));
+  res.json({ success: true, suggestions });
+});
+
+// GET /api/stats — platform stats
+app.get('/api/stats', (req, res) => {
+  res.json({
+    success: true,
+    stats: {
+      totalListings: db.listings.filter(l => l.status === 'active').length,
+      totalUsers: db.users.length,
+      totalCategories: CATEGORIES.length,
+      featuredListings: db.listings.filter(l => l.featured && l.status === 'active').length,
+    }
+  });
+});
+
+// ── HEALTH CHECK ──
+app.get('/health', (req, res) => res.json({ status: '✅ Bazaar Ind API running!', version: '1.0.0', timestamp: new Date() }));
+app.get('/', (req, res) => res.json({ message: '🏪 Bazaar Ind API — नया India का नया Bazaar', docs: '/api/docs' }));
+
+// ── START SERVER ──
+app.listen(PORT, () => {
+  console.log(\n🏪 BAZAAR IND SERVER RUNNING);
+  console.log(📍 http://localhost:${PORT});
+  console.log(✅ API Ready — नया India का नया Bazaar\n);
+});
+
+module.exports = app;
